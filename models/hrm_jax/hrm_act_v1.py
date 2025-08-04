@@ -4,11 +4,12 @@ import math
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+import equinox as eqx
+from equinox import nn
 from pydantic import BaseModel
 
 from .common import trunc_normal_init
-from .layers import RMSNorm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from .layers import RMSNorm, SwiGLU, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 
 
 class HierarchicalReasoningModel_ACTV1InnerCarry(NamedTuple):
@@ -44,169 +45,197 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     forward_dtype: str = "bfloat16"
 
 
-class HierarchicalReasoningModel_ACTV1Block(nn.Module):
-    config: HierarchicalReasoningModel_ACTV1Config
+class HierarchicalReasoningModel_ACTV1Block(eqx.Module):
+    attn: nn.MultiheadAttention
+    mlp: SwiGLU
+    norm1: RMSNorm
+    norm2: RMSNorm
 
-    @nn.compact
+    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config, *, key: jax.random.PRNGKey):
+        attn_key, mlp_key = jax.random.split(key)
+        self.attn = nn.MultiheadAttention(
+            num_heads=config.num_heads,
+            query_size=config.hidden_size,
+            use_query_bias=True,
+            use_key_bias=True,
+            use_value_bias=True,
+            use_output_bias=True,
+            key=attn_key,
+        )
+        self.mlp = SwiGLU(hidden_size=config.hidden_size, expansion=config.expansion, key=mlp_key)
+        self.norm1 = RMSNorm(variance_epsilon=config.rms_norm_eps)
+        self.norm2 = RMSNorm(variance_epsilon=config.rms_norm_eps)
+
     def __call__(self, cos_sin: CosSin, hidden_states: jnp.ndarray) -> jnp.ndarray:
-        # Post Norm
-        # Self Attention
-        attn = Attention(
-            hidden_size=self.config.hidden_size,
-            head_dim=self.config.hidden_size // self.config.num_heads,
-            num_heads=self.config.num_heads,
-            num_key_value_heads=self.config.num_heads,
-            causal=False,
-        )
-        hidden_states = RMSNorm(variance_epsilon=self.config.rms_norm_eps)(
-            hidden_states + attn(cos_sin=cos_sin, hidden_states=hidden_states)
-        )
-        # Fully Connected
-        mlp = SwiGLU(hidden_size=self.config.hidden_size, expansion=self.config.expansion)
-        hidden_states = RMSNorm(variance_epsilon=self.config.rms_norm_eps)(
-            hidden_states + mlp(hidden_states)
-        )
+        normed_hidden_states = self.norm1(hidden_states)
+        attn_output = jax.vmap(self.attn)(query=normed_hidden_states, key_=normed_hidden_states, value=normed_hidden_states)
+        hidden_states = hidden_states + attn_output
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
 
-class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
-    layers: List[nn.Module]
+class HierarchicalReasoningModel_ACTV1ReasoningModule(eqx.Module):
+    layers: List[HierarchicalReasoningModel_ACTV1Block]
 
-    @nn.compact
+    def __init__(self, num_layers: int, config: HierarchicalReasoningModel_ACTV1Config, *, key: jax.random.PRNGKey):
+        keys = jax.random.split(key, num_layers)
+        self.layers = [
+            HierarchicalReasoningModel_ACTV1Block(config, key=k) for k in keys
+        ]
+
     def __call__(
         self, hidden_states: jnp.ndarray, input_injection: jnp.ndarray, **kwargs
     ) -> jnp.ndarray:
-        # Input injection (add)
         hidden_states = hidden_states + input_injection
-        # Layers
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states, **kwargs)
         return hidden_states
 
 
-class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
-    config: HierarchicalReasoningModel_ACTV1Config
+class HierarchicalReasoningModel_ACTV1_Inner(eqx.Module):
+    config: HierarchicalReasoningModel_ACTV1Config = eqx.field(static=True)
+    embed_tokens: CastedEmbedding
+    lm_head: CastedLinear
+    q_head: CastedLinear
+    puzzle_emb: Optional[CastedEmbedding]
+    rotary_emb: Optional[RotaryEmbedding]
+    embed_pos: Optional[CastedEmbedding]
+    H_level: HierarchicalReasoningModel_ACTV1ReasoningModule
+    L_level: HierarchicalReasoningModel_ACTV1ReasoningModule
 
-    @nn.compact
-    def __call__(
-        self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, jnp.ndarray]
-    ) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
-        forward_dtype = getattr(jnp, self.config.forward_dtype)
-        embed_scale = math.sqrt(self.config.hidden_size)
+    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config, *, key: jax.random.PRNGKey):
+        self.config = config
+        keys = jax.random.split(key, 6)
+        forward_dtype = getattr(jnp, config.forward_dtype)
+        embed_scale = math.sqrt(config.hidden_size)
         embed_init_std = 1.0 / embed_scale
-        puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
 
-        embed_tokens = CastedEmbedding(
-            self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, dtype=forward_dtype
+        self.embed_tokens = CastedEmbedding(
+            config.vocab_size, config.hidden_size, init_std=embed_init_std, dtype=forward_dtype, key=keys[0]
         )
-        lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, use_bias=False)
-        q_head = CastedLinear(self.config.hidden_size, 2, use_bias=True)
+        self.lm_head = CastedLinear(config.hidden_size, config.vocab_size, use_bias=False, key=keys[1])
+        self.q_head = CastedLinear(config.hidden_size, 2, use_bias=True, key=keys[2])
 
-        if self.config.puzzle_emb_ndim > 0:
-            puzzle_emb = CastedEmbedding(
-                self.config.num_puzzle_identifiers,
-                self.config.puzzle_emb_ndim,
+        if config.puzzle_emb_ndim > 0:
+            self.puzzle_emb = CastedEmbedding(
+                config.num_puzzle_identifiers,
+                config.puzzle_emb_ndim,
                 init_std=0,
                 dtype=forward_dtype,
+                key=keys[3],
             )
+        else:
+            self.puzzle_emb = None
 
-        if self.config.pos_encodings == "rope":
-            rotary_emb = RotaryEmbedding(
-                dim=self.config.hidden_size // self.config.num_heads,
-                max_position_embeddings=self.config.seq_len + puzzle_emb_len,
-                base=self.config.rope_theta,
+        if config.pos_encodings == "rope":
+            self.rotary_emb = RotaryEmbedding(
+                dim=config.hidden_size // config.num_heads,
+                max_position_embeddings=config.seq_len + self.puzzle_emb_len,
+                base=config.rope_theta,
             )
-        elif self.config.pos_encodings == "learned":
-            embed_pos = CastedEmbedding(
-                self.config.seq_len + puzzle_emb_len,
-                self.config.hidden_size,
+            self.embed_pos = None
+        elif config.pos_encodings == "learned":
+            self.embed_pos = CastedEmbedding(
+                config.seq_len + self.puzzle_emb_len,
+                config.hidden_size,
                 init_std=embed_init_std,
                 dtype=forward_dtype,
+                key=keys[4],
             )
+            self.rotary_emb = None
         else:
             raise NotImplementedError()
 
-        H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(
-            layers=[
-                HierarchicalReasoningModel_ACTV1Block(self.config)
-                for _i in range(self.config.H_layers)
-            ]
+        self.H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(
+            config.H_layers, config, key=keys[5]
         )
-        L_level = HierarchicalReasoningModel_ACTV1ReasoningModule(
-            layers=[
-                HierarchicalReasoningModel_ACTV1Block(self.config)
-                for _i in range(self.config.L_layers)
-            ]
+        self.L_level = HierarchicalReasoningModel_ACTV1ReasoningModule(
+            config.L_layers, config, key=keys[5]
         )
 
-        def _input_embeddings(input: jnp.ndarray, puzzle_identifiers: jnp.ndarray):
-            embedding = embed_tokens(input.astype(jnp.int32))
-            if self.config.puzzle_emb_ndim > 0:
-                puzzle_embedding = puzzle_emb(puzzle_identifiers)
-                pad_count = puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
-                if pad_count > 0:
-                    puzzle_embedding = jnp.pad(puzzle_embedding, ((0, 0), (0, pad_count)))
-                embedding = jnp.concatenate(
-                    (
-                        puzzle_embedding.reshape(-1, puzzle_emb_len, self.config.hidden_size),
-                        embedding,
-                    ),
-                    axis=-2,
-                )
-            if self.config.pos_encodings == "learned":
-                embedding = 0.707106781 * (embedding + embed_pos.embedding_weight.astype(forward_dtype))
-            return embed_scale * embedding
+    @property
+    def puzzle_emb_len(self):
+        return -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
 
-        seq_info = dict(cos_sin=rotary_emb() if hasattr(self, "rotary_emb") else None)
-        input_embeddings = _input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+    def _input_embeddings(self, input: jnp.ndarray, puzzle_identifiers: jnp.ndarray):
+        embedding = self.embed_tokens(input.astype(jnp.int32))
+        if self.puzzle_emb is not None:
+            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
+            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+            if pad_count > 0:
+                puzzle_embedding = jnp.pad(puzzle_embedding, ((0, 0), (0, pad_count)))
+            embedding = jnp.concatenate(
+                (
+                    puzzle_embedding.reshape(-1, self.puzzle_emb_len, self.config.hidden_size),
+                    embedding,
+                ),
+                axis=-2,
+            )
+        if self.embed_pos is not None:
+            embedding = 0.707106781 * (embedding + self.embed_pos.weight.astype(getattr(jnp, self.config.forward_dtype)))
+        return math.sqrt(self.config.hidden_size) * embedding
+
+    def __call__(
+        self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, jnp.ndarray]
+    ) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
+        seq_info = dict(cos_sin=self.rotary_emb() if self.rotary_emb is not None else None)
+        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         def fwd_iter(z_H, z_L):
             for _H_step in range(self.config.H_cycles):
                 for _L_step in range(self.config.L_cycles):
                     if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
-                        z_L = L_level(z_L, z_H + input_embeddings, **seq_info)
+                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                 if not (_H_step == self.config.H_cycles - 1):
-                    z_H = H_level(z_H, z_L, **seq_info)
+                    z_H = self.H_level(z_H, z_L, **seq_info)
             return z_H, z_L
 
         z_H, z_L = jax.lax.stop_gradient(fwd_iter(carry.z_H, carry.z_L))
-        z_L = L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = H_level(z_H, z_L, **seq_info)
+        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+        z_H = self.H_level(z_H, z_L, **seq_info)
 
         new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=jax.lax.stop_gradient(z_H), z_L=jax.lax.stop_gradient(z_L))
-        output = lm_head(z_H)[:, puzzle_emb_len:]
-        q_logits = q_head(z_H[:, 0]).astype(jnp.float32)
+        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        q_logits = self.q_head(z_H[:, 0]).astype(jnp.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
-class HierarchicalReasoningModel_ACTV1(nn.Module):
-    config: HierarchicalReasoningModel_ACTV1Config
+class HierarchicalReasoningModel_ACTV1(eqx.Module):
+    config: HierarchicalReasoningModel_ACTV1Config = eqx.field(static=True)
+    inner: HierarchicalReasoningModel_ACTV1_Inner
+    H_init: jax.Array
+    L_init: jax.Array
 
-    @nn.compact
+    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config, *, key: jax.random.PRNGKey):
+        self.config = config
+        inner_key, h_key, l_key = jax.random.split(key, 3)
+        self.inner = HierarchicalReasoningModel_ACTV1_Inner(config, key=inner_key)
+        self.H_init = trunc_normal_init(stddev=1.0)(
+            h_key, (config.hidden_size,), getattr(jnp, config.forward_dtype)
+        )
+        self.L_init = trunc_normal_init(stddev=1.0)(
+            l_key, (config.hidden_size,), getattr(jnp, config.forward_dtype)
+        )
+
     def __call__(
-        self, carry: HierarchicalReasoningModel_ACTV1Carry, batch: Dict[str, jnp.ndarray]
+        self, carry: HierarchicalReasoningModel_ACTV1Carry, batch: Dict[str, jnp.ndarray], *, key: jax.random.PRNGKey
     ) -> Tuple[HierarchicalReasoningModel_ACTV1Carry, Dict[str, jnp.ndarray]]:
-        inner = HierarchicalReasoningModel_ACTV1_Inner(self.config)
-        
-        H_init = self.param("H_init", trunc_normal_init(stddev=1.0), (self.config.hidden_size,), getattr(jnp, self.config.forward_dtype))
-        L_init = self.param("L_init", trunc_normal_init(stddev=1.0), (self.config.hidden_size,), getattr(jnp, self.config.forward_dtype))
-
         def reset_carry(reset_flag: jnp.ndarray, carry: HierarchicalReasoningModel_ACTV1InnerCarry):
             return HierarchicalReasoningModel_ACTV1InnerCarry(
-                z_H=jnp.where(reset_flag.reshape(-1, 1, 1), H_init, carry.z_H),
-                z_L=jnp.where(reset_flag.reshape(-1, 1, 1), L_init, carry.z_L),
+                z_H=jnp.where(reset_flag.reshape(-1, 1, 1), self.H_init, carry.z_H),
+                z_L=jnp.where(reset_flag.reshape(-1, 1, 1), self.L_init, carry.z_L),
             )
 
         new_inner_carry = reset_carry(carry.halted, carry.inner_carry)
         new_steps = jnp.where(carry.halted, 0, carry.steps)
         new_current_data = {
             k: jnp.where(
-                carry.halted.reshape((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v
+                carry.halted.reshape((-1,) + (1,) * (v.ndim - 1)), v, carry.current_data.get(k, v)
             )
-            for k, v in carry.current_data.items()
+            for k, v in batch.items()
         }
 
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = inner(
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(
             new_inner_carry, new_current_data
         )
         outputs = {
@@ -222,16 +251,17 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
         if self.config.halt_max_steps > 1:
             halted = halted | (q_halt_logits > q_continue_logits)
             min_halt_steps = (
-                jax.random.uniform(self.make_rng("dropout")) < self.config.halt_exploration_prob
-            ) * jax.random.randint(
-                self.make_rng("dropout"),
-                new_steps.shape,
-                2,
-                self.config.halt_max_steps + 1,
-                new_steps.dtype,
+                (jax.random.uniform(key) < self.config.halt_exploration_prob)
+                * jax.random.randint(
+                    key,
+                    new_steps.shape,
+                    2,
+                    self.config.halt_max_steps + 1,
+                    new_steps.dtype,
+                )
             )
             halted = halted & (new_steps >= min_halt_steps)
-            next_q_halt_logits, next_q_continue_logits = inner(new_inner_carry, new_current_data)[-1]
+            next_q_halt_logits, next_q_continue_logits = self.inner(new_inner_carry, new_current_data)[-1]
             outputs["target_q_continue"] = jax.nn.sigmoid(
                 jnp.where(
                     is_last_step,
@@ -266,10 +296,11 @@ if __name__ == "__main__":
         halt_exploration_prob=0.1,
     )
 
-    model = HierarchicalReasoningModel_ACTV1(config)
+    key = jax.random.PRNGKey(0)
+    model = HierarchicalReasoningModel_ACTV1(config, key=key)
 
     @jax.jit
-    def init_model():
+    def init_and_run_model():
         key = jax.random.PRNGKey(0)
         batch = {
             "inputs": jnp.ones((config.batch_size, config.seq_len), dtype=jnp.int32),
@@ -289,12 +320,10 @@ if __name__ == "__main__":
             current_data={k: jnp.zeros_like(v) for k, v in batch.items()},
         )
         
-        params = model.init({"params": key, "dropout": key}, carry, batch)
-        return params, carry, batch
+        (new_carry, outputs) = model(carry, batch, key=key)
+        return new_carry, outputs
 
-    params, carry, batch = init_model()
-    key = jax.random.PRNGKey(42)
-    (new_carry, outputs), updated_state = model.apply(params, carry, batch, mutable=["batch_stats"], rngs={"dropout": key})
+    new_carry, outputs = init_and_run_model()
 
     print("Model created and applied successfully.")
     print("Output logits shape:", outputs["logits"].shape)

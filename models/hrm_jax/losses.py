@@ -1,8 +1,8 @@
-from typing import Any, Tuple, Dict, Sequence, Optional
+from typing import Any, Tuple, Dict, Sequence, Optional, Callable
 
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
+import equinox as eqx
 import optax
 
 
@@ -36,14 +36,13 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
     return loss
 
 
-class ACTLossHead(nn.Module):
-    model: nn.Module
-    loss_type: str
+class ACTLossHead(eqx.Module):
+    model: eqx.Module
+    loss_fn: Callable = eqx.field(static=True)
 
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)
 
-    @nn.compact
     def __call__(
         self,
         return_keys: Sequence[str],
@@ -76,8 +75,7 @@ class ACTLossHead(nn.Module):
         }
 
         # Losses
-        loss_fn = globals()[self.loss_type]
-        lm_loss = (loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
+        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
         q_halt_loss = optax.sigmoid_binary_cross_entropy(
             outputs["q_halt_logits"], seq_is_correct.astype(outputs["q_halt_logits"].dtype)
         ).sum()

@@ -1,4 +1,4 @@
-name: hrm.hrm_act_v1@HierarchicalReasoningModel_ACTV1
+name: hrm_jax.hrm_act_v1@HierarchicalReasoningModel_ACTV1
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy

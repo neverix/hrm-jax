@@ -15,12 +15,14 @@ import tqdm
 import wandb
 import coolname
 import hydra
+from models.hrm_jax import losses
 import pydantic
 from omegaconf import DictConfig
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
 from models.hrm_jax.hrm_act_v1 import HierarchicalReasoningModel_ACTV1, HierarchicalReasoningModel_ACTV1Config, HierarchicalReasoningModel_ACTV1Carry, HierarchicalReasoningModel_ACTV1InnerCarry
+from models.hrm_jax.losses import ACTLossHead
 
 
 class LossConfig(pydantic.BaseModel):
@@ -70,10 +72,9 @@ class PretrainConfig(pydantic.BaseModel):
     eval_save_outputs: List[str] = []
 
 
-@dataclass
-class TrainState:
+class TrainState(eqx.Module):
     model: eqx.Module
-    tx: optax.GradientTransformation
+    tx: optax.GradientTransformation = eqx.field(static=True)
     opt_state: optax.OptState
     carry: Any
     key: jax.random.PRNGKey
@@ -115,7 +116,10 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     )
 
     key = jax.random.PRNGKey(config.seed)
-    model = HierarchicalReasoningModel_ACTV1(model_cfg)
+    model = HierarchicalReasoningModel_ACTV1(model_cfg, key=key)
+    loss_function_name = getattr(config.arch.loss, 'loss_type', 'stablemax_cross_entropy')
+    loss_fn = getattr(losses, loss_function_name)
+    model = ACTLossHead(model, loss_fn=loss_fn)
 
     # Optimizers and lr
     tx = optax.adamw(
@@ -148,25 +152,25 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     # Initialize with a dummy batch
     key, subkey = jax.random.split(key)
     dummy_batch = {
-        "inputs": jnp.ones((model.config.batch_size, model.config.seq_len), dtype=jnp.int32),
-        "puzzle_identifiers": jnp.ones((model.config.batch_size,), dtype=jnp.int32),
+        "inputs": jnp.ones((model.model.config.batch_size, model.model.config.seq_len), dtype=jnp.int32),
+        "labels": jnp.ones((model.model.config.batch_size, model.model.config.seq_len), dtype=jnp.int32),
+        "puzzle_identifiers": jnp.ones((model.model.config.batch_size,), dtype=jnp.int32),
     }
     
-    puzzle_emb_len = -(model.config.puzzle_emb_ndim // -model.config.hidden_size)
+    puzzle_emb_len = -(model.model.config.puzzle_emb_ndim // -model.model.config.hidden_size)
     inner_carry = HierarchicalReasoningModel_ACTV1InnerCarry(
-        z_H=jnp.zeros((model.config.batch_size, model.config.seq_len + puzzle_emb_len, model.config.hidden_size)),
-        z_L=jnp.zeros((model.config.batch_size, model.config.seq_len + puzzle_emb_len, model.config.hidden_size)),
+        z_H=jnp.zeros((model.model.config.batch_size, model.model.config.seq_len + puzzle_emb_len, model.model.config.hidden_size)),
+        z_L=jnp.zeros((model.model.config.batch_size, model.model.config.seq_len + puzzle_emb_len, model.model.config.hidden_size)),
     )
     
     dummy_carry = HierarchicalReasoningModel_ACTV1Carry(
         inner_carry=inner_carry,
-        steps=jnp.zeros((model.config.batch_size,), dtype=jnp.int32),
-        halted=jnp.ones((model.config.batch_size,), dtype=jnp.bool_),
+        steps=jnp.zeros((model.model.config.batch_size,), dtype=jnp.int32),
+        halted=jnp.ones((model.model.config.batch_size,), dtype=jnp.bool_),
         current_data={k: jnp.zeros_like(v) for k, v in dummy_batch.items()},
     )
 
-    params = model.init(subkey, dummy_carry, dummy_batch)
-    opt_state = tx.init(params)
+    opt_state = tx.init(eqx.filter(model, eqx.is_array))
 
     return TrainState(
         step=0,
@@ -175,7 +179,7 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         model=model,
         tx=tx,
         opt_state=opt_state,
-        carry=None,
+        carry=dummy_carry,
         key=key,
     )
 
@@ -198,27 +202,34 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
 
 @eqx.filter_jit
 def train_batch(train_state: TrainState, batch: Any):
-    train_state.step += 1
-    if train_state.step > train_state.total_steps:
+    if train_state.step >= train_state.total_steps:
         return train_state, {}
 
-    # Init carry if it is None
-    if train_state.carry is None:
-        train_state.carry = train_state.model.initial_carry(batch)
+    key, new_key = jax.random.split(train_state.key)
 
     def loss_fn(model, carry, batch):
-        new_carry, outputs = model(carry, batch)
-        # TODO: Add proper loss calculation
-        return jnp.mean(outputs["logits"]), (new_carry, outputs)
+        new_carry, loss, metrics, _, _ = model(
+            return_keys=[], carry=carry, batch=batch, key=key
+        )
+        return loss, (new_carry, metrics)
 
-    (loss, (new_carry, outputs)), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(train_state.model, train_state.carry, batch)
+    (loss, (new_carry, metrics)), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(train_state.model, train_state.carry, batch)
     
-    updates, new_opt_state = train_state.tx.update(grads, train_state.opt_state)
+    updates, new_opt_state = train_state.tx.update(grads, train_state.opt_state, train_state.model)
     new_model = eqx.apply_updates(train_state.model, updates)
 
-    metrics = {"train/loss": loss}
+    metrics["train/loss"] = loss
 
-    return train_state._replace(model=new_model, opt_state=new_opt_state, carry=new_carry), metrics
+    new_step = train_state.step + 1
+    return TrainState(
+        model=new_model,
+        tx=train_state.tx,
+        opt_state=new_opt_state,
+        carry=new_carry,
+        key=new_key,
+        step=new_step,
+        total_steps=train_state.total_steps,
+    ), metrics
 
 @eqx.filter_jit
 def evaluate(train_state: TrainState, eval_loader: DataLoader):
