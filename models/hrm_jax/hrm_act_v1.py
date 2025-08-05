@@ -13,8 +13,11 @@ from .layers import RMSNorm, SwiGLU, RotaryEmbedding, CosSin, CastedEmbedding, C
 
 import einops
 from jaxtyping import Array, Float
+from jax._src import config as jax_config
 try:
     from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+    from jax.experimental.shard_map import shard_map
+    from jax.sharding import PartitionSpec
     _has_flash_attn = True
 except ImportError:
     _has_flash_attn = False
@@ -33,9 +36,11 @@ def _flash_mha_forward(
 ) -> Float[Array, "q_seq o_size"]:
     del mask, key, inference, deterministic  # Unused.
 
-    query_heads = jax.vmap(self._project, in_axes=(None, 0))(self.query_proj, query)
-    key_heads = jax.vmap(self._project, in_axes=(None, 0))(self.key_proj, key_)
-    value_heads = jax.vmap(self._project, in_axes=(None, 0))(self.value_proj, value)
+    mesh, = jax_config.mesh_context_manager.value
+
+    query_heads = eqx.filter_vmap(self._project, in_axes=(None, 0))(self.query_proj, query)
+    key_heads = eqx.filter_vmap(self._project, in_axes=(None, 0))(self.key_proj, key_)
+    value_heads = eqx.filter_vmap(self._project, in_axes=(None, 0))(self.value_proj, value)
 
     if process_heads is not None:
         query_heads, key_heads, value_heads = process_heads(
@@ -52,8 +57,17 @@ def _flash_mha_forward(
     query_heads = jnp.pad(query_heads, ((0, 0), (0, 0), (0, padded_seq_len - seq_len), (0, 0)))
     key_heads = jnp.pad(key_heads, ((0, 0), (0, 0), (0, padded_seq_len - seq_len), (0, 0)))
     value_heads = jnp.pad(value_heads, ((0, 0), (0, 0), (0, padded_seq_len - value_heads.shape[2]), (0, 0)))
+    def flash_attention_fn(q, k, v):
+        return flash_attention(q, k, v, causal=False)
 
-    attn = flash_attention(query_heads, key_heads, value_heads, causal=False)[:, :, :seq_len, :]
+    attn = jax.shard_map(
+        flash_attention_fn,
+        mesh=mesh,
+        in_specs=(PartitionSpec("data", None, None, None), PartitionSpec("data", None, None, None), PartitionSpec("data", None, None, None)),
+        out_specs=PartitionSpec("data", None, None, None),
+        check_vma=False
+    )(query_heads, key_heads, value_heads)[:, :, :seq_len, :]
+
     attn = einops.rearrange(attn, "b h s d -> b s (h d)")
 
     return eqx.filter_vmap(eqx.filter_vmap(self.output_proj, in_axes=0), in_axes=0)(attn)

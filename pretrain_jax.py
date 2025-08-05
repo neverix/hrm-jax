@@ -220,7 +220,7 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
         min_ratio=config.lr_min_ratio
     )
 
-@eqx.filter_jit
+@eqx.filter_jit(donate="all")
 def train_batch(train_state: TrainState, batch: Any):
     if train_state.step >= train_state.total_steps:
         return train_state, {}
@@ -324,7 +324,8 @@ def launch(hydra_config: DictConfig):
     eval_loader,  eval_metadata  = create_dataloader(config, "test", rank=rank, world_size=world_size, test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size)
 
     # Train state
-    train_state = init_train_state(config, train_metadata, mesh)
+    with mesh:
+        train_state = init_train_state(config, train_metadata, mesh)
 
     # Progress bar and logger
     progress_bar = tqdm.tqdm(total=train_state.total_steps)
@@ -340,12 +341,13 @@ def launch(hydra_config: DictConfig):
         ############ Train Iter
         for _, batch, _ in train_loader:
             batch = {k: jnp.asarray(v) for k, v in batch.items()}
-            
-            # Shard the batch to all devices
-            batch_sharding = jax.tree.map(lambda x: NamedSharding(mesh, PartitionSpec('data')), batch)
-            batch = jax.device_put(batch, batch_sharding)
+                
+            with mesh:    
+                # Shard the batch to all devices
+                batch_sharding = jax.tree.map(lambda x: NamedSharding(mesh, PartitionSpec('data')), batch)
+                batch = jax.device_put(batch, batch_sharding)
 
-            train_state, metrics = train_batch(train_state, batch)
+                train_state, metrics = train_batch(train_state, batch)
 
             if metrics:
                 wandb.log(metrics, step=train_state.step)
