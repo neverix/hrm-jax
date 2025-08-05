@@ -11,6 +11,57 @@ from pydantic import BaseModel
 from .common import trunc_normal_init
 from .layers import RMSNorm, SwiGLU, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 
+import einops
+from jaxtyping import Array, Float
+try:
+    from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+    _has_flash_attn = True
+except ImportError:
+    _has_flash_attn = False
+
+def _flash_mha_forward(
+    self,
+    query: Float[Array, "q_seq q_size"],
+    key_: Float[Array, "kv_seq k_size"],
+    value: Float[Array, "kv_seq v_size"],
+    mask: Optional[Array] = None,
+    *,
+    key: Optional[jax.random.PRNGKey] = None,
+    inference: Optional[bool] = None,
+    deterministic: Optional[bool] = None,
+    process_heads = None,
+) -> Float[Array, "q_seq o_size"]:
+    del mask, key, inference, deterministic  # Unused.
+
+    query_heads = jax.vmap(self._project, in_axes=(None, 0))(self.query_proj, query)
+    key_heads = jax.vmap(self._project, in_axes=(None, 0))(self.key_proj, key_)
+    value_heads = jax.vmap(self._project, in_axes=(None, 0))(self.value_proj, value)
+
+    if process_heads is not None:
+        query_heads, key_heads, value_heads = process_heads(
+            query_heads, key_heads, value_heads
+        )
+
+    query_heads = einops.rearrange(query_heads, "b s h d -> b h s d")
+    key_heads = einops.rearrange(key_heads, "b s h d -> b h s d")
+    value_heads = einops.rearrange(value_heads, "b s h d -> b h s d")
+
+    pad_seq_len = 128
+    seq_len = query_heads.shape[2]
+    padded_seq_len = ((seq_len + pad_seq_len - 1) // pad_seq_len) * pad_seq_len
+    query_heads = jnp.pad(query_heads, ((0, 0), (0, 0), (0, padded_seq_len - seq_len), (0, 0)))
+    key_heads = jnp.pad(key_heads, ((0, 0), (0, 0), (0, padded_seq_len - seq_len), (0, 0)))
+    value_heads = jnp.pad(value_heads, ((0, 0), (0, 0), (0, padded_seq_len - value_heads.shape[2]), (0, 0)))
+
+    attn = flash_attention(query_heads, key_heads, value_heads, causal=False)[:, :, :seq_len, :]
+    attn = einops.rearrange(attn, "b h s d -> b s (h d)")
+
+    return eqx.filter_vmap(eqx.filter_vmap(self.output_proj, in_axes=0), in_axes=0)(attn)
+
+if _has_flash_attn:
+    eqx.nn.MultiheadAttention.__call__ = _flash_mha_forward
+
+
 
 class HierarchicalReasoningModel_ACTV1InnerCarry(NamedTuple):
     z_H: jnp.ndarray
@@ -68,7 +119,7 @@ class HierarchicalReasoningModel_ACTV1Block(eqx.Module):
 
     def __call__(self, cos_sin: CosSin, hidden_states: jnp.ndarray) -> jnp.ndarray:
         normed_hidden_states = self.norm1(hidden_states)
-        attn_output = jax.vmap(self.attn)(query=normed_hidden_states, key_=normed_hidden_states, value=normed_hidden_states)
+        attn_output = self.attn(query=normed_hidden_states, key_=normed_hidden_states, value=normed_hidden_states)
         hidden_states = hidden_states + attn_output
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states

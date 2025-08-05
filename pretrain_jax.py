@@ -24,6 +24,9 @@ from utils.functions import load_model_class, get_model_source_path
 from models.hrm_jax.hrm_act_v1 import HierarchicalReasoningModel_ACTV1, HierarchicalReasoningModel_ACTV1Config, HierarchicalReasoningModel_ACTV1Carry, HierarchicalReasoningModel_ACTV1InnerCarry
 from models.hrm_jax.losses import ACTLossHead
 
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
+from jax.experimental import mesh_utils
+
 
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
@@ -142,7 +145,8 @@ def cosine_schedule_with_warmup_lr_lambda(
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
 
-def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
+def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, mesh: Mesh):
+    world_size = mesh.size
     # Estimated total training steps
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
 
@@ -151,24 +155,40 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     
     # Initialize with a dummy batch
     key, subkey = jax.random.split(key)
+    batch_size = config.global_batch_size // world_size
     dummy_batch = {
-        "inputs": jnp.ones((model.model.config.batch_size, model.model.config.seq_len), dtype=jnp.int32),
-        "labels": jnp.ones((model.model.config.batch_size, model.model.config.seq_len), dtype=jnp.int32),
-        "puzzle_identifiers": jnp.ones((model.model.config.batch_size,), dtype=jnp.int32),
+        "inputs": jnp.ones((batch_size, model.model.config.seq_len), dtype=jnp.int32),
+        "labels": jnp.ones((batch_size, model.model.config.seq_len), dtype=jnp.int32),
+        "puzzle_identifiers": jnp.ones((batch_size,), dtype=jnp.int32),
     }
     
     puzzle_emb_len = -(model.model.config.puzzle_emb_ndim // -model.model.config.hidden_size)
     inner_carry = HierarchicalReasoningModel_ACTV1InnerCarry(
-        z_H=jnp.zeros((model.model.config.batch_size, model.model.config.seq_len + puzzle_emb_len, model.model.config.hidden_size)),
-        z_L=jnp.zeros((model.model.config.batch_size, model.model.config.seq_len + puzzle_emb_len, model.model.config.hidden_size)),
+        z_H=jnp.zeros((batch_size, model.model.config.seq_len + puzzle_emb_len, model.model.config.hidden_size)),
+        z_L=jnp.zeros((batch_size, model.model.config.seq_len + puzzle_emb_len, model.model.config.hidden_size)),
     )
     
     dummy_carry = HierarchicalReasoningModel_ACTV1Carry(
         inner_carry=inner_carry,
-        steps=jnp.zeros((model.model.config.batch_size,), dtype=jnp.int32),
-        halted=jnp.ones((model.model.config.batch_size,), dtype=jnp.bool_),
+        steps=jnp.zeros((batch_size,), dtype=jnp.int32),
+        halted=jnp.ones((batch_size,), dtype=jnp.bool_),
         current_data={k: jnp.zeros_like(v) for k, v in dummy_batch.items()},
     )
+
+    def init_fn(model, carry):
+        return model, carry
+
+    def get_sharding(tree: Any):
+        return jax.tree.map(
+            lambda x: NamedSharding(mesh, PartitionSpec()),
+            tree
+        )
+
+    model_sharding = get_sharding(eqx.filter(model, eqx.is_array))
+    carry_sharding = get_sharding(dummy_carry)
+
+    model = eqx.filter_shard(model, model_sharding)
+    dummy_carry = eqx.filter_shard(dummy_carry, carry_sharding)
 
     opt_state = tx.init(eqx.filter(model, eqx.is_array))
 
@@ -282,9 +302,12 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
-    # For now, we'll stick to a single device
-    rank = 0
-    world_size = 1
+    rank = jax.process_index()
+    world_size = jax.local_device_count()
+
+    # Create a mesh
+    devices = mesh_utils.create_device_mesh((world_size, 1))
+    mesh = Mesh(devices, axis_names=('data', 'model'))
 
     config = load_synced_config(hydra_config, rank, world_size)
 
@@ -301,7 +324,7 @@ def launch(hydra_config: DictConfig):
     eval_loader,  eval_metadata  = create_dataloader(config, "test", rank=rank, world_size=world_size, test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size)
 
     # Train state
-    train_state = init_train_state(config, train_metadata, world_size=world_size)
+    train_state = init_train_state(config, train_metadata, mesh)
 
     # Progress bar and logger
     progress_bar = tqdm.tqdm(total=train_state.total_steps)
@@ -317,6 +340,11 @@ def launch(hydra_config: DictConfig):
         ############ Train Iter
         for _, batch, _ in train_loader:
             batch = {k: jnp.asarray(v) for k, v in batch.items()}
+            
+            # Shard the batch to all devices
+            batch_sharding = jax.tree.map(lambda x: NamedSharding(mesh, PartitionSpec('data')), batch)
+            batch = jax.device_put(batch, batch_sharding)
+
             train_state, metrics = train_batch(train_state, batch)
 
             if metrics:
@@ -338,3 +366,4 @@ def launch(hydra_config: DictConfig):
 
 if __name__ == "__main__":
     launch()
+
