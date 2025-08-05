@@ -1,5 +1,5 @@
 from typing import Optional, Any, Sequence, List
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import math
 import yaml
@@ -252,9 +252,94 @@ def train_batch(train_state: TrainState, batch: Any):
     ), metrics
 
 @eqx.filter_jit
-def evaluate(train_state: TrainState, eval_loader: DataLoader):
-    # TODO: Implement evaluation
-    return {}
+def evaluate_batch(train_state: TrainState, batch: Any):
+    key, new_key = jax.random.split(train_state.key)
+
+    def loss_fn(model, carry, batch):
+        new_carry, loss, metrics, _, _ = model(
+            return_keys=[], carry=carry, batch=batch, key=key
+        )
+        return loss, (new_carry, metrics)
+
+    (loss, (new_carry, metrics)), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(train_state.model, train_state.carry, batch)
+    
+    metrics["eval/loss"] = loss
+
+    return metrics
+
+def evaluate(train_state: TrainState, eval_loader: DataLoader, total_batches: int = None):
+    all_metrics = []
+    for _, batch, _ in (bar := tqdm.tqdm(eval_loader, total=total_batches)):
+        batch = {k: jnp.asarray(v) for k, v in batch.items()}
+        metrics = evaluate_batch(train_state, batch)
+        all_metrics.append(metrics)
+        bar.set_postfix(metrics)
+
+    if not all_metrics:
+        return {}
+
+    # Average metrics across all batches
+    return {k: jnp.mean(jnp.stack([m[k] for m in all_metrics])) for k in all_metrics[0].keys()}
+
+
+def get_getter(name: str):
+    if not name:
+        return lambda x: x
+    first, _, last = name.partition(".")
+    last_getter = get_getter(last)
+    def getter(model):
+        if isinstance(model, list):
+            child = model[int(first)]
+        else:
+            child = getattr(model, first)
+        return last_getter(child)
+    return getter
+
+
+def load_pytorch_checkpoint(config: PretrainConfig, train_state: TrainState) -> TrainState:
+    if config.checkpoint_path is None or not config.checkpoint_path.endswith('.pth'):
+        return train_state
+
+    import torch
+    from collections import OrderedDict
+
+    print(f"Loading PyTorch checkpoint from {config.checkpoint_path}")
+    pytorch_state_dict = torch.load(config.checkpoint_path, map_location="cpu")
+
+    if 'model' in pytorch_state_dict:
+        pytorch_state_dict = pytorch_state_dict['model']
+
+    new_state_dict = OrderedDict()
+    for k, v in pytorch_state_dict.items():
+        # Adjust key names if necessary
+        new_k = k.replace("module.", "")
+        new_state_dict[new_k] = v.cpu().float().numpy()
+
+    def load_weights(model, state_dict):
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.endswith(".qkv_proj.weight"):
+                base_name = k[:-len(".qkv_proj.weight")]
+                q, k, v = jnp.split(v, 3, axis=-0)
+                new_state_dict[f"{base_name}.query_proj.weight"] = q
+                new_state_dict[f"{base_name}.key_proj.weight"] = k
+                new_state_dict[f"{base_name}.value_proj.weight"] = v
+            elif k.endswith(".o_proj.weight"):
+                base_name = k[:-len(".o_proj.weight")]
+                new_state_dict[f"{base_name}.output_proj.weight"] = v
+            else:
+                new_state_dict[k] = v
+        for k, v in new_state_dict.items():
+            if k.startswith("_orig_mod."):
+                k = k[len("_orig_mod."):]
+            model = eqx.tree_at(get_getter(k), model, v)
+        return model
+
+    
+    loaded_model = load_weights(train_state.model, new_state_dict)
+
+    return replace(train_state, model=loaded_model)
+
 
 def save_code_and_config(config: PretrainConfig):
     if config.checkpoint_path is None or wandb.run is None:

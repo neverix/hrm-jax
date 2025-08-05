@@ -1,3 +1,40 @@
+# hrm-jax
+
+This is an Equinox implementation of the Hierarchical Reasoning Model (HRM). Vibecoded with Gemini CLI.
+
+Features:
+- Data parallel
+- Flash attention
+- Working architecture?
+- Working training?
+
+## Install
+
+```bash
+uv sync
+git submodule update --init --recursive
+
+uv run python dataset/build_arc_dataset.py
+uv run python dataset/build_arc_dataset.py --dataset-dirs dataset/raw-data/ARC-AGI-2/data --output-dir data/arc-2-aug-1000
+uv run python dataset/build_sudoku_dataset.py
+uv run python dataset/build_sudoku_dataset.py --output-dir data/sudoku-extreme-1k-aug-1000  --subsample-size 1000 --num-aug 1000
+uv run python dataset/build_maze_dataset.py
+```
+
+## Evaluate
+
+```bash
+mkdir -p eval_data/maze
+wget -c 'https://huggingface.co/sapientinc/HRM-checkpoint-maze-30x30-hard/resolve/main/checkpoint' -O eval_data/maze/checkpoint.pth
+wget -c 'https://huggingface.co/sapientinc/HRM-checkpoint-maze-30x30-hard/resolve/main/all_config.yaml' -O eval_data/maze/all_config.yaml
+
+uv run python evaluate_jax.py checkpoint_path=eval_data/maze/checkpoint.pth
+
+
+
+
+
+
 # Hierarchical Reasoning Model
 
 ![](./assets/hrm.png)

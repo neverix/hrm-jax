@@ -62,17 +62,34 @@ class CastedLinear(eqx.Module):
 class CastedEmbedding(eqx.Module):
     num_embeddings: int
     embedding_dim: int
-    weight: jax.Array
+    embedding_weight: jax.Array
 
     def __init__(self, num_embeddings: int, embedding_dim: int, init_std: float, dtype: jnp.dtype, *, key: jax.random.PRNGKey):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        self.weight = trunc_normal_init(stddev=init_std)(
+        self.embedding_weight = trunc_normal_init(stddev=init_std)(
             key, (num_embeddings, embedding_dim), dtype=dtype
         )
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        return self.weight[x].astype(self.weight.dtype)
+        return self.embedding_weight[x].astype(self.embedding_weight.dtype)
+
+
+class CastedSparseEmbedding(eqx.Module):
+    num_embeddings: int
+    embedding_dim: int
+    weights: jax.Array
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, init_std: float, dtype: jnp.dtype, *, key: jax.random.PRNGKey):
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weights = trunc_normal_init(stddev=init_std)(
+            key, (num_embeddings, embedding_dim), dtype=dtype
+        )
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        return self.weights[x].astype(self.weights.dtype)
+
 
 
 class RotaryEmbedding(eqx.Module):
