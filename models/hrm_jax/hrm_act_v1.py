@@ -9,72 +9,170 @@ from equinox import nn
 from pydantic import BaseModel
 
 from .common import trunc_normal_init
-from .layers import RMSNorm, SwiGLU, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear, CastedSparseEmbedding
+from .layers import RMSNorm, SwiGLU, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear, CastedSparseEmbedding, apply_rotary_pos_emb
 
 import einops
 from jaxtyping import Array, Float
 from jax._src import config as jax_config
 try:
-    from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+    from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention, SegmentIds
     from jax.experimental.shard_map import shard_map
     from jax.sharding import PartitionSpec
     _has_flash_attn = True
 except ImportError:
     _has_flash_attn = False
 
-def _flash_mha_forward(
-    self,
-    query: Float[Array, "q_seq q_size"],
-    key_: Float[Array, "kv_seq k_size"],
-    value: Float[Array, "kv_seq v_size"],
-    mask: Optional[Array] = None,
-    *,
-    key: Optional[jax.random.PRNGKey] = None,
-    inference: Optional[bool] = None,
-    deterministic: Optional[bool] = None,
-    process_heads = None,
-) -> Float[Array, "q_seq o_size"]:
-    del mask, key, inference, deterministic  # Unused.
+# def _flash_mha_forward(
+#     self,
+#     query: Float[Array, "q_seq q_size"],
+#     key_: Float[Array, "kv_seq k_size"],
+#     value: Float[Array, "kv_seq v_size"],
+#     mask: Optional[Array] = None,
+#     *,
+#     key: Optional[jax.random.PRNGKey] = None,
+#     inference: Optional[bool] = None,
+#     deterministic: Optional[bool] = None,
+#     process_heads = None,
+# ) -> Float[Array, "q_seq o_size"]:
+#     del mask, key, inference, deterministic  # Unused.
 
-    mesh, = jax_config.mesh_context_manager.value
+#     try:
+#         mesh, = jax_config.mesh_context_manager.value
+#     except ValueError:
+#         mesh = None
 
-    query_heads = eqx.filter_vmap(self._project, in_axes=(None, 0))(self.query_proj, query)
-    key_heads = eqx.filter_vmap(self._project, in_axes=(None, 0))(self.key_proj, key_)
-    value_heads = eqx.filter_vmap(self._project, in_axes=(None, 0))(self.value_proj, value)
+#     query_heads = eqx.filter_vmap(self._project, in_axes=(None, 0))(self.query_proj, query)
+#     key_heads = eqx.filter_vmap(self._project, in_axes=(None, 0))(self.key_proj, key_)
+#     value_heads = eqx.filter_vmap(self._project, in_axes=(None, 0))(self.value_proj, value)
 
-    if process_heads is not None:
-        query_heads, key_heads, value_heads = process_heads(
-            query_heads, key_heads, value_heads
+#     query_heads = einops.rearrange(query_heads, "b s h d -> b h s d")
+#     key_heads = einops.rearrange(key_heads, "b s h d -> b h s d")
+#     value_heads = einops.rearrange(value_heads, "b s h d -> b h s d")
+
+#     pad_seq_len = 128
+#     seq_len = query_heads.shape[2]
+#     padded_seq_len = ((seq_len + pad_seq_len - 1) // pad_seq_len) * pad_seq_len
+#     query_heads = jnp.pad(query_heads, ((0, 0), (0, 0), (0, padded_seq_len - seq_len), (0, 0)))
+#     key_heads = jnp.pad(key_heads, ((0, 0), (0, 0), (0, padded_seq_len - seq_len), (0, 0)))
+#     value_heads = jnp.pad(value_heads, ((0, 0), (0, 0), (0, padded_seq_len - value_heads.shape[2]), (0, 0)))
+#     def flash_attention_fn(q, k, v, sids):
+#         q = q / (q.shape[-3] ** 0.5)
+#         return flash_attention(q, k, v, segment_ids=SegmentIds(q=sids, kv=sids), causal=False)
+
+#     if mesh is not None:
+#         flash_attention_fn = jax.shard_map(
+#             flash_attention_fn,
+#             mesh=mesh,
+#             in_specs=(
+#                 PartitionSpec("data", None, None, None),
+#                 PartitionSpec("data", None, None, None),
+#                 PartitionSpec("data", None, None, None),
+#                 PartitionSpec("data", None, None, None),
+#             ),
+#             out_specs=PartitionSpec("data", None, None, None),
+#             check_vma=False
+#         )
+    
+#     segment_ids = (jnp.arange(padded_seq_len, dtype=jnp.int32) < seq_len).astype(jnp.int32)
+#     segment_ids = segment_ids.reshape(1, -1).repeat(query_heads.shape[0], axis=0)
+    
+#     query_heads = query_heads * 0
+#     key_heads = key_heads * 0
+#     # value_heads = value_heads * 0 + 1
+    
+#     attn = flash_attention_fn(query_heads, key_heads, value_heads, segment_ids)
+#     attn = attn[:, :, :seq_len, :]
+
+#     attn = einops.rearrange(attn, "b h s d -> b s (h d)")
+
+#     # return attn
+#     return eqx.filter_vmap(eqx.filter_vmap(self.output_proj, in_axes=0), in_axes=0)(attn)
+
+# if _has_flash_attn:
+#     eqx.nn.MultiheadAttention.__call__ = _flash_mha_forward
+
+
+class Attention(eqx.Module):
+    qkv_proj: CastedLinear
+    o_proj: CastedLinear
+    num_heads: int = eqx.field(static=True)
+    num_kv_heads: int = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
+    causal: bool = eqx.field(static=True)
+    
+    def __init__(self, num_heads: int, num_kv_heads: int, hidden_size: int, key: jax.random.PRNGKey, causal=False):
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = hidden_size // num_heads
+        self.causal = causal
+        self.qkv_proj = CastedLinear(
+            in_features=hidden_size,
+            out_features=(num_heads + 2 * num_kv_heads) * self.head_dim,
+            use_bias=False,
+            key=key,
         )
+        self.o_proj = CastedLinear(
+            in_features=num_kv_heads * self.head_dim,
+            out_features=hidden_size,
+            use_bias=False,
+            key=key,
+        )
+    
+    def __call__(self, cos_sin: CosSin, hidden_states: jnp.ndarray) -> jnp.ndarray:
+        try:
+            mesh, = jax_config.mesh_context_manager.value
+        except ValueError:
+            mesh = None
+        
+        qkv = self.qkv_proj(hidden_states)
+        qkv = qkv.reshape(hidden_states.shape[0], hidden_states.shape[1], self.num_heads + 2 * self.num_kv_heads, self.head_dim)
+        query = qkv[:, :, :self.num_heads]
+        key = qkv[:, :, self.num_heads: self.num_heads + self.num_kv_heads]
+        value = qkv[:, :, self.num_heads + self.num_kv_heads:]
+        
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+        
+        
+        query_heads = einops.rearrange(query, "b s h d -> b h s d")
+        key_heads = einops.rearrange(key, "b s h d -> b h s d")
+        value_heads = einops.rearrange(value, "b s h d -> b h s d")
 
-    query_heads = einops.rearrange(query_heads, "b s h d -> b h s d")
-    key_heads = einops.rearrange(key_heads, "b s h d -> b h s d")
-    value_heads = einops.rearrange(value_heads, "b s h d -> b h s d")
+        pad_seq_len = 128
+        seq_len = query_heads.shape[2]
+        padded_seq_len = ((seq_len + pad_seq_len - 1) // pad_seq_len) * pad_seq_len
+        query_heads = jnp.pad(query_heads, ((0, 0), (0, 0), (0, padded_seq_len - seq_len), (0, 0)))
+        key_heads = jnp.pad(key_heads, ((0, 0), (0, 0), (0, padded_seq_len - seq_len), (0, 0)))
+        value_heads = jnp.pad(value_heads, ((0, 0), (0, 0), (0, padded_seq_len - value_heads.shape[2]), (0, 0)))
+        def flash_attention_fn(q, k, v, sids):
+            q = q / (q.shape[-1] ** 0.5)
+            
+            return flash_attention(q, k, v, segment_ids=SegmentIds(q=sids, kv=sids), causal=False)
 
-    pad_seq_len = 128
-    seq_len = query_heads.shape[2]
-    padded_seq_len = ((seq_len + pad_seq_len - 1) // pad_seq_len) * pad_seq_len
-    query_heads = jnp.pad(query_heads, ((0, 0), (0, 0), (0, padded_seq_len - seq_len), (0, 0)))
-    key_heads = jnp.pad(key_heads, ((0, 0), (0, 0), (0, padded_seq_len - seq_len), (0, 0)))
-    value_heads = jnp.pad(value_heads, ((0, 0), (0, 0), (0, padded_seq_len - value_heads.shape[2]), (0, 0)))
-    def flash_attention_fn(q, k, v):
-        return flash_attention(q, k, v, causal=False)
+        if mesh is not None:
+            flash_attention_fn = jax.shard_map(
+                flash_attention_fn,
+                mesh=mesh,
+                in_specs=(
+                    PartitionSpec("data", None, None, None),
+                    PartitionSpec("data", None, None, None),
+                    PartitionSpec("data", None, None, None),
+                    PartitionSpec("data", None),
+                ),
+                out_specs=PartitionSpec("data", None, None, None),
+                check_vma=False
+            )
+        
+        segment_ids = (jnp.arange(padded_seq_len, dtype=jnp.int32) < seq_len).astype(jnp.int32)
+        segment_ids = segment_ids.reshape(1, -1).repeat(query_heads.shape[0], axis=0)
+        
+        attn = flash_attention_fn(query_heads, key_heads, value_heads, segment_ids)
+        attn = attn[:, :, :seq_len, :]
 
-    attn = jax.shard_map(
-        flash_attention_fn,
-        mesh=mesh,
-        in_specs=(PartitionSpec("data", None, None, None), PartitionSpec("data", None, None, None), PartitionSpec("data", None, None, None)),
-        out_specs=PartitionSpec("data", None, None, None),
-        check_vma=False
-    )(query_heads, key_heads, value_heads)[:, :, :seq_len, :]
+        attn = einops.rearrange(attn, "b h s d -> b s (h d)")
 
-    attn = einops.rearrange(attn, "b h s d -> b s (h d)")
-
-    return eqx.filter_vmap(eqx.filter_vmap(self.output_proj, in_axes=0), in_axes=0)(attn)
-
-if _has_flash_attn:
-    eqx.nn.MultiheadAttention.__call__ = _flash_mha_forward
-
+        return self.o_proj(attn)
 
 
 class HierarchicalReasoningModel_ACTV1InnerCarry(NamedTuple):
@@ -111,20 +209,17 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
 
 
 class HierarchicalReasoningModel_ACTV1Block(eqx.Module):
-    self_attn: nn.MultiheadAttention
+    self_attn: Attention
     mlp: SwiGLU
     norm1: RMSNorm
     norm2: RMSNorm
 
     def __init__(self, config: HierarchicalReasoningModel_ACTV1Config, *, key: jax.random.PRNGKey):
         attn_key, mlp_key = jax.random.split(key)
-        self.self_attn = nn.MultiheadAttention(
+        self.self_attn = Attention(
             num_heads=config.num_heads,
-            query_size=config.hidden_size,
-            use_query_bias=True,
-            use_key_bias=True,
-            use_value_bias=True,
-            use_output_bias=True,
+            num_kv_heads=config.num_heads,
+            hidden_size=config.hidden_size,
             key=attn_key,
         )
         self.mlp = SwiGLU(hidden_size=config.hidden_size, expansion=config.expansion, key=mlp_key)
@@ -132,10 +227,11 @@ class HierarchicalReasoningModel_ACTV1Block(eqx.Module):
         self.norm2 = RMSNorm(variance_epsilon=config.rms_norm_eps)
 
     def __call__(self, cos_sin: CosSin, hidden_states: jnp.ndarray) -> jnp.ndarray:
-        normed_hidden_states = self.norm1(hidden_states)
-        attn_output = self.self_attn(query=normed_hidden_states, key_=normed_hidden_states, value=normed_hidden_states)
-        hidden_states = hidden_states + attn_output
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        # normed_hidden_states = self.norm1(hidden_states)
+        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+        hidden_states = self.norm1(hidden_states + attn_output)
+        hidden_states = hidden_states + self.mlp(hidden_states)
+        hidden_states = self.norm2(hidden_states)
         return hidden_states
 
 
