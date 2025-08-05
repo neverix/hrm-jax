@@ -29,11 +29,7 @@ wget -c 'https://huggingface.co/sapientinc/HRM-checkpoint-maze-30x30-hard/resolv
 wget -c 'https://huggingface.co/sapientinc/HRM-checkpoint-maze-30x30-hard/resolve/main/all_config.yaml' -O eval_data/maze/all_config.yaml
 
 uv run python evaluate_jax.py checkpoint_path=eval_data/maze/checkpoint.pth
-
-
-
-
-
+```
 
 # Hierarchical Reasoning Model
 
