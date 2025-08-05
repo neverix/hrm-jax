@@ -321,18 +321,23 @@ def load_pytorch_checkpoint(config: PretrainConfig, train_state: TrainState) -> 
             if k.endswith(".qkv_proj.weight"):
                 base_name = k[:-len(".qkv_proj.weight")]
                 q, k, v = jnp.split(v, 3, axis=-0)
-                new_state_dict[f"{base_name}.query_proj.weight"] = q
-                new_state_dict[f"{base_name}.key_proj.weight"] = k
-                new_state_dict[f"{base_name}.value_proj.weight"] = v
+                new_state_dict[f"{base_name}.query_proj.weight"] = q.T
+                new_state_dict[f"{base_name}.key_proj.weight"] = k.T
+                new_state_dict[f"{base_name}.value_proj.weight"] = v.T
             elif k.endswith(".o_proj.weight"):
                 base_name = k[:-len(".o_proj.weight")]
-                new_state_dict[f"{base_name}.output_proj.weight"] = v
+                new_state_dict[f"{base_name}.output_proj.weight"] = v.T
             else:
                 new_state_dict[k] = v
+        not_loaded = set(new_state_dict.keys())
         for k, v in new_state_dict.items():
-            if k.startswith("_orig_mod."):
-                k = k[len("_orig_mod."):]
-            model = eqx.tree_at(get_getter(k), model, v)
+            name = k
+            if name.startswith("_orig_mod."):
+                name = name[len("_orig_mod."):]
+            model = eqx.tree_at(get_getter(name), model, v)
+            not_loaded.remove(k)
+        if not_loaded:
+            print(f"Not loaded: {not_loaded}")
         return model
 
     
