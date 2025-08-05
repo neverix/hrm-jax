@@ -84,7 +84,7 @@ def build_config_from_state_dict(arch_cfg: Dict, state_dict: Dict) -> Dict:
 
     # Select an arbitrary (but consistent with config) seq_len for the random
     # input. 32 works for small debug runs.
-    seq_len = 127
+    seq_len = 143
 
     cfg = {
         "batch_size": 1,
@@ -211,14 +211,28 @@ def main():
     def _tensor_to_np(t):
         return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else jax.device_get(t)
 
+    def _generate_rotary_cos_sin(seq_len: int, head_dim: int, base: float = 10000.0):
+        """Generate rotary positional embeddings (cos, sin) identical to RotaryEmbedding."""
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        freqs = torch.outer(torch.arange(seq_len, dtype=torch.float32), inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos(), emb.sin()
+
     def compare_block(pt_block, jax_block, name: str):
         bs, seq_len, dim = cfg["batch_size"], cfg["seq_len"], cfg["hidden_size"]
         x_pt = torch.randn(bs, seq_len, dim, dtype=torch.float32)
+
+        # Rotary embeddings (shared between PT/JAX)
+        head_dim = dim // cfg["num_heads"]
+        cos_t, sin_t = _generate_rotary_cos_sin(seq_len, head_dim)
+        cos_sin_pt = (cos_t, sin_t)
+        cos_sin_jax = (jnp.asarray(cos_t.numpy()), jnp.asarray(sin_t.numpy()))
+
         with torch.no_grad():
-            out_pt = pt_block(cos_sin=None, hidden_states=x_pt).cpu()
+            out_pt = pt_block(cos_sin=cos_sin_pt, hidden_states=x_pt).cpu()
 
         x_jax = jnp.asarray(x_pt.numpy())
-        out_jax = jax_block(cos_sin=None, hidden_states=x_jax)
+        out_jax = jax_block(cos_sin=cos_sin_jax, hidden_states=x_jax)
         diff = abs(_tensor_to_np(out_pt) - _tensor_to_np(out_jax)).max()
         print(f"[Block diff] {name}: {diff}")
         return diff
@@ -308,9 +322,11 @@ def main():
 
             # Attention diff
             if hasattr(pt_b, "self_attn") and hasattr(j_b, "self_attn"):
+                cos_sin_pt = _generate_rotary_cos_sin(cfg["seq_len"], cfg["hidden_size"] // cfg["num_heads"])
+                cos_sin_jax = (jnp.asarray(cos_sin_pt[0].numpy()), jnp.asarray(cos_sin_pt[1].numpy()))
                 with torch.no_grad():
-                    out_pt_attn = pt_b.self_attn(cos_sin=None, hidden_states=x_pt).cpu()
-                out_jax_attn = j_b.self_attn(cos_sin=None, hidden_states=jnp.asarray(x_pt.numpy()))
+                    out_pt_attn = pt_b.self_attn(cos_sin=cos_sin_pt, hidden_states=x_pt).cpu()
+                out_jax_attn = j_b.self_attn(cos_sin=cos_sin_jax, hidden_states=jnp.asarray(x_pt.numpy()))
                 diff_attn = abs(_tensor_to_np(out_pt_attn) - _tensor_to_np(out_jax_attn)).max()
                 print(f"   └─ Attn diff: {diff_attn}")
 
@@ -325,9 +341,11 @@ def main():
             print(f"   └─ MLP diff: {diff_mlp}")
 
             if hasattr(pt_b, "self_attn") and hasattr(j_b, "self_attn"):
+                cos_sin_pt = _generate_rotary_cos_sin(cfg["seq_len"], cfg["hidden_size"] // cfg["num_heads"])
+                cos_sin_jax = (jnp.asarray(cos_sin_pt[0].numpy()), jnp.asarray(cos_sin_pt[1].numpy()))
                 with torch.no_grad():
-                    out_pt_attn = pt_b.self_attn(cos_sin=None, hidden_states=x_pt).cpu()
-                out_jax_attn = j_b.self_attn(cos_sin=None, hidden_states=jnp.asarray(x_pt.numpy()))
+                    out_pt_attn = pt_b.self_attn(cos_sin=cos_sin_pt, hidden_states=x_pt).cpu()
+                out_jax_attn = j_b.self_attn(cos_sin=cos_sin_jax, hidden_states=jnp.asarray(x_pt.numpy()))
                 diff_attn = abs(_tensor_to_np(out_pt_attn) - _tensor_to_np(out_jax_attn)).max()
                 print(f"   └─ Attn diff: {diff_attn}")
 

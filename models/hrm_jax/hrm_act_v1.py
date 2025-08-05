@@ -378,6 +378,29 @@ class HierarchicalReasoningModel_ACTV1(eqx.Module):
         self.config = config
         self.inner = HierarchicalReasoningModel_ACTV1_Inner(config, key=key)
 
+    # ------------------------------------------------------------------
+    # Public helper – builds a fresh carry for a given batch size.
+    # Mirrors the logic used in `init_train_state` / PyTorch counterpart.
+    # ------------------------------------------------------------------
+
+    def initial_carry(self, batch: Dict[str, jnp.ndarray]):
+        """Create a zero-initialised `HierarchicalReasoningModel_ACTV1Carry` compatible with the batch."""
+
+        bs = batch["inputs"].shape[0]
+        puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
+
+        inner_carry = HierarchicalReasoningModel_ACTV1InnerCarry(
+            z_H=jnp.zeros((bs, self.config.seq_len + puzzle_emb_len, self.config.hidden_size), dtype=jnp.float32),
+            z_L=jnp.zeros((bs, self.config.seq_len + puzzle_emb_len, self.config.hidden_size), dtype=jnp.float32),
+        )
+
+        return HierarchicalReasoningModel_ACTV1Carry(
+            inner_carry=inner_carry,
+            steps=jnp.zeros((bs,), dtype=jnp.int32),
+            halted=jnp.ones((bs,), dtype=jnp.bool_),
+            current_data={k: jnp.zeros_like(v) for k, v in batch.items()},
+        )
+
     def __call__(
         self, carry: HierarchicalReasoningModel_ACTV1Carry, batch: Dict[str, jnp.ndarray], *, key: jax.random.PRNGKey
     ) -> Tuple[HierarchicalReasoningModel_ACTV1Carry, Dict[str, jnp.ndarray]]:

@@ -220,52 +220,53 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
         min_ratio=config.lr_min_ratio
     )
 
-@eqx.filter_jit(donate="all")
-def train_batch(train_state: TrainState, batch: Any):
-    if train_state.step >= train_state.total_steps:
-        return train_state, {}
-
-    key, new_key = jax.random.split(train_state.key)
-
-    def loss_fn(model, carry, batch):
-        new_carry, loss, metrics, _, _ = model(
-            return_keys=[], carry=carry, batch=batch, key=key
-        )
-        return loss, (new_carry, metrics)
-
-    (loss, (new_carry, metrics)), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(train_state.model, train_state.carry, batch)
-    
-    updates, new_opt_state = train_state.tx.update(grads, train_state.opt_state, train_state.model)
-    new_model = eqx.apply_updates(train_state.model, updates)
-
-    metrics["train/loss"] = loss
-
-    new_step = train_state.step + 1
-    return TrainState(
-        model=new_model,
-        tx=train_state.tx,
-        opt_state=new_opt_state,
-        carry=new_carry,
-        key=new_key,
-        step=new_step,
-        total_steps=train_state.total_steps,
-    ), metrics
-
-@eqx.filter_jit
 def evaluate_batch(train_state: TrainState, batch: Any):
-    key, new_key = jax.random.split(train_state.key)
+    """Run the model repeatedly on *one* logical sequence until it signals completion (all_finish).
 
-    def loss_fn(model, carry, batch):
-        new_carry, loss, metrics, _, _ = model(
-            return_keys=[], carry=carry, batch=batch, key=key
-        )
-        return loss, (new_carry, metrics)
+    This mirrors the PyTorch evaluation loop and guarantees identical halting semantics during JAX evaluation.
+    Metrics are summed over steps and returned (caller is responsible for normalisation)."""
 
-    (loss, (new_carry, metrics)), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(train_state.model, train_state.carry, batch)
+    # Initial carry for this batch (construct manually if method absent)
+    carry = train_state.model.initial_carry(batch)  # type: ignore
+
+    key = train_state.key
+
+    metrics_accum = None
+
+    # JIT-compiled single step
+    @eqx.filter_jit
+    def _eval_step(m, c, b, k):
+        return m(return_keys=[], carry=c, batch=b, key=k)
+
+    bar = tqdm.tqdm()
+    while True:
+        key, subkey = jax.random.split(key)
+        
+        new_carry, loss, metrics, _, all_finish = _eval_step(train_state.model, carry, batch, subkey)
+
+        # Attach loss to metrics for consistency with training loop
+        metrics = dict(metrics)
+        metrics["eval/loss"] = loss
+
+        if metrics_accum is None:
+            metrics_accum = metrics
+        else:
+            metrics_accum = {
+                k: metrics_accum.get(k, 0) + metrics[k] for k in metrics
+            }
+
+        if all_finish:
+            break
+
+        carry = new_carry
+        bar.update(1)
+        bar.set_postfix(metrics)
+    bar.close()
     
-    metrics["eval/loss"] = loss
+    count = metrics_accum["count"]
+    metrics_accum = {k: v / count for k, v in metrics_accum.items()}
 
-    return metrics
+    return metrics_accum
 
 def evaluate(train_state: TrainState, eval_loader: DataLoader, total_batches: int = None):
     all_metrics = []
