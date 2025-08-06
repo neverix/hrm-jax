@@ -220,6 +220,36 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
         min_ratio=config.lr_min_ratio
     )
 
+@eqx.filter_value_and_grad(has_aux=True)
+def loss_fn(model, carry, batch, key):
+    new_carry, loss, metrics, _, _ = model(
+        return_keys=[], carry=carry, batch=batch, key=key
+    )
+    return loss, (new_carry, metrics)
+
+@eqx.filter_jit(donate="all")
+def train_batch(train_state: TrainState, batch: Any):
+    if train_state.step >= train_state.total_steps:
+        return train_state, {}
+
+    key, new_key = jax.random.split(train_state.key)
+
+    (loss, (new_carry, metrics)), grads = loss_fn(train_state.model, train_state.carry, batch, key)
+    
+    updates, new_opt_state = train_state.tx.update(grads, train_state.opt_state, train_state.model)
+    new_model = eqx.apply_updates(train_state.model, updates)
+
+    metrics["train/loss"] = loss
+
+    new_step = train_state.step + 1
+    return replace(train_state,
+        model=new_model,
+        opt_state=new_opt_state,
+        carry=new_carry,
+        key=new_key,
+        step=new_step,
+    ), metrics
+
 def evaluate_batch(train_state: TrainState, batch: Any):
     """Run the model repeatedly on *one* logical sequence until it signals completion (all_finish).
 

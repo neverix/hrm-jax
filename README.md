@@ -32,7 +32,13 @@ mkdir -p eval_data/sudoku
 wget -c 'https://huggingface.co/sapientinc/HRM-checkpoint-sudoku-extreme/resolve/main/checkpoint' -O eval_data/sudoku/checkpoint.pth
 wget -c 'https://huggingface.co/sapientinc/HRM-checkpoint-sudoku-extreme/resolve/main/all_config.yaml' -O eval_data/sudoku/all_config.yaml
 
-uv run python evaluate_jax.py checkpoint_path=eval_data/maze/checkpoint.pth
+uv run python evaluate_jax.py checkpoint_path=eval_data/maze/checkpoint.pth  # 99%
+uv run python evaluate_jax.py checkpoint_path=eval_data/sudoku/checkpoint.pth  # 27%
+```
+
+## Train
+```bash
+./train_arc
 ```
 
 # Hierarchical Reasoning Model
