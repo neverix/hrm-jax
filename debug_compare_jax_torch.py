@@ -67,7 +67,7 @@ def torch_load_state_dict(ckpt_path: str):
     return cleaned
 
 
-def build_config_from_state_dict(arch_cfg: Dict, state_dict: Dict) -> Dict:
+def build_config_from_state_dict(arch_cfg: Dict, state_dict: Dict, name="") -> Dict:
     """Derive missing fields (vocab_size, num_puzzle_identifiers) from the
     checkpoint weights so that the model config perfectly matches the saved
     parameters."""
@@ -84,14 +84,14 @@ def build_config_from_state_dict(arch_cfg: Dict, state_dict: Dict) -> Dict:
 
     # Select an arbitrary (but consistent with config) seq_len for the random
     # input. 32 works for small debug runs.
-    seq_len = 143
 
+    print(arch_cfg)
     cfg = {
         "batch_size": 1,
-        "seq_len": seq_len,
         "puzzle_emb_ndim": arch_cfg["puzzle_emb_ndim"],
         "num_puzzle_identifiers": num_puzzle_ids,
         "vocab_size": vocab_size,
+        "seq_len": 900 if "maze" in name else 81,
         **{k: arch_cfg[k] for k in [
             "H_cycles",
             "L_cycles",

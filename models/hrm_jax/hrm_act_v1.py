@@ -373,10 +373,12 @@ class HierarchicalReasoningModel_ACTV1_Inner(eqx.Module):
 class HierarchicalReasoningModel_ACTV1(eqx.Module):
     config: HierarchicalReasoningModel_ACTV1Config = eqx.field(static=True)
     inner: HierarchicalReasoningModel_ACTV1_Inner
+    inference: bool
 
-    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config, *, key: jax.random.PRNGKey):
+    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config, inference: bool = False, *, key: jax.random.PRNGKey):
         self.config = config
         self.inner = HierarchicalReasoningModel_ACTV1_Inner(config, key=key)
+        self.inference = inference
 
     # ------------------------------------------------------------------
     # Public helper – builds a fresh carry for a given batch size.
@@ -384,21 +386,19 @@ class HierarchicalReasoningModel_ACTV1(eqx.Module):
     # ------------------------------------------------------------------
 
     def initial_carry(self, batch: Dict[str, jnp.ndarray]):
-        """Create a zero-initialised `HierarchicalReasoningModel_ACTV1Carry` compatible with the batch."""
-
         bs = batch["inputs"].shape[0]
         puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
 
         inner_carry = HierarchicalReasoningModel_ACTV1InnerCarry(
-            z_H=jnp.zeros((bs, self.config.seq_len + puzzle_emb_len, self.config.hidden_size), dtype=jnp.float32),
-            z_L=jnp.zeros((bs, self.config.seq_len + puzzle_emb_len, self.config.hidden_size), dtype=jnp.float32),
+            z_H=jnp.zeros((bs, self.config.seq_len + puzzle_emb_len, self.config.hidden_size), dtype=jnp.float32) + self.inner.H_init,
+            z_L=jnp.zeros((bs, self.config.seq_len + puzzle_emb_len, self.config.hidden_size), dtype=jnp.float32) + self.inner.L_init,
         )
 
         return HierarchicalReasoningModel_ACTV1Carry(
             inner_carry=inner_carry,
             steps=jnp.zeros((bs,), dtype=jnp.int32),
             halted=jnp.ones((bs,), dtype=jnp.bool_),
-            current_data={k: jnp.zeros_like(v) for k, v in batch.items()},
+            current_data=batch,
         )
 
     def __call__(
@@ -432,7 +432,7 @@ class HierarchicalReasoningModel_ACTV1(eqx.Module):
         is_last_step = new_steps >= self.config.halt_max_steps
         halted = is_last_step
 
-        if self.config.halt_max_steps > 1:
+        if self.config.halt_max_steps > 1 and not self.inference:
             halted = halted | (q_halt_logits > q_continue_logits)
             min_halt_steps = (
                 (jax.random.uniform(key) < self.config.halt_exploration_prob)

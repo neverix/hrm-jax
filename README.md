@@ -28,6 +28,10 @@ mkdir -p eval_data/maze
 wget -c 'https://huggingface.co/sapientinc/HRM-checkpoint-maze-30x30-hard/resolve/main/checkpoint' -O eval_data/maze/checkpoint.pth
 wget -c 'https://huggingface.co/sapientinc/HRM-checkpoint-maze-30x30-hard/resolve/main/all_config.yaml' -O eval_data/maze/all_config.yaml
 
+mkdir -p eval_data/sudoku
+wget -c 'https://huggingface.co/sapientinc/HRM-checkpoint-sudoku-extreme/resolve/main/checkpoint' -O eval_data/sudoku/checkpoint.pth
+wget -c 'https://huggingface.co/sapientinc/HRM-checkpoint-sudoku-extreme/resolve/main/all_config.yaml' -O eval_data/sudoku/all_config.yaml
+
 uv run python evaluate_jax.py checkpoint_path=eval_data/maze/checkpoint.pth
 ```
 

@@ -96,9 +96,10 @@ class ACTLossHead(eqx.Module):
         # Filter outputs for return
         detached_outputs = {k: outputs[k] for k in return_keys if k in outputs}
 
+        loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
         return (
             new_carry,
-            lm_loss + 0.5 * (q_halt_loss + q_continue_loss),
+            loss,
             metrics,
             detached_outputs,
             jnp.all(new_carry.halted),

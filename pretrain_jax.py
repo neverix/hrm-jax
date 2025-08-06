@@ -239,10 +239,11 @@ def evaluate_batch(train_state: TrainState, batch: Any):
         return m(return_keys=[], carry=c, batch=b, key=k)
 
     bar = tqdm.tqdm()
+    inf_model = eqx.nn.inference_mode(train_state.model)
     while True:
         key, subkey = jax.random.split(key)
         
-        new_carry, loss, metrics, _, all_finish = _eval_step(train_state.model, carry, batch, subkey)
+        new_carry, loss, metrics, _, all_finish = _eval_step(inf_model, carry, batch, subkey)
 
         # Attach loss to metrics for consistency with training loop
         metrics = dict(metrics)

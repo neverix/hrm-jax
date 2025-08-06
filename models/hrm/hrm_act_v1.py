@@ -2,6 +2,7 @@ from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
 
+from tqdm import trange, tqdm
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -93,7 +94,7 @@ class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
         # Input injection (add)
         hidden_states = hidden_states + input_injection
         # Layers
-        for layer in self.layers:
+        for layer in tqdm(self.layers, desc="Reasoning Layers"):
             hidden_states = layer(hidden_states=hidden_states, **kwargs)
 
         return hidden_states
@@ -189,8 +190,8 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             z_H, z_L = carry.z_H, carry.z_L
 
-            for _H_step in range(self.config.H_cycles):
-                for _L_step in range(self.config.L_cycles):
+            for _H_step in trange(self.config.H_cycles):
+                for _L_step in trange(self.config.L_cycles):
                     if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
                         z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
 
@@ -229,7 +230,7 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
         batch_size = batch["inputs"].shape[0]
 
         return HierarchicalReasoningModel_ACTV1Carry(
-            inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
+            inner_carry=self.inner.reset_carry(torch.ones((batch_size, ), dtype=torch.bool), self.inner.empty_carry(batch_size)),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
             halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
